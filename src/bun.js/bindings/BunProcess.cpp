@@ -1068,10 +1068,18 @@ static void onDidChangeListeners(EventEmitter& eventEmitter, const Identifier& e
         }
 
         if (auto signalNumber = signalNameToNumberMap->get(eventName.string())) {
-#if !OS(WINDOWS)
+#if OS(LINUX)
+            // SIGKILL and SIGSTOP cannot be handled, and JSC needs its own signal handler to
+            // suspend and resume the JS thread which we must not override.
+            if (signalNumber != SIGKILL && signalNumber != SIGSTOP && signalNumber != g_wtfConfig.sigThreadSuspendResume) {
+#elif OS(DARWIN)
+            // these signals cannot be handled
             if (signalNumber != SIGKILL && signalNumber != SIGSTOP) {
+#elif OS(WINDOWS)
+            // windows has no SIGSTOP
+            if (signalNumber != SIGKILL) {
 #else
-            if (signalNumber != SIGKILL) { // windows has no SIGSTOP
+#error unknown OS
 #endif
 
                 if (isAdded) {
@@ -1298,15 +1306,13 @@ bool setProcessExitCodeInner(JSC::JSGlobalObject* lexicalGlobalObject, Process* 
                 code = jsDoubleNumber(num);
             }
         }
-        Bun::V::validateInteger(throwScope, lexicalGlobalObject, code, "code"_s, jsUndefined(), jsUndefined());
-        RETURN_IF_EXCEPTION(throwScope, false);
-
-        int exitCodeInt = code.toInt32(lexicalGlobalObject) % 256;
+        ssize_t exitCodeInt;
+        Bun::V::validateInteger(throwScope, lexicalGlobalObject, code, "code"_s, jsUndefined(), jsUndefined(), &exitCodeInt);
         RETURN_IF_EXCEPTION(throwScope, false);
 
         process->m_isExitCodeObservable = true;
         void* ptr = jsCast<Zig::GlobalObject*>(process->globalObject())->bunVM();
-        Bun__setExitCode(ptr, static_cast<uint8_t>(exitCodeInt));
+        Bun__setExitCode(ptr, static_cast<uint8_t>(exitCodeInt % 256));
     }
     return true;
 }
@@ -2018,10 +2024,14 @@ static JSValue constructProcessHrtimeObject(VM& vm, JSObject* processObject)
 
     return hrtime;
 }
+enum class BunProcessStdinFdType : int32_t {
+    file = 0,
+    pipe = 1,
+    socket = 2,
+};
+extern "C" BunProcessStdinFdType Bun__Process__getStdinFdType(void*, int fd);
 
-#if OS(WINDOWS)
-extern "C" void Bun__ForceFileSinkToBeSynchronousOnWindows(JSC::JSGlobalObject*, JSC::EncodedJSValue);
-#endif
+extern "C" void Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(JSC::JSGlobalObject*, JSC::EncodedJSValue);
 static JSValue constructStdioWriteStream(JSC::JSGlobalObject* globalObject, int fd)
 {
     auto& vm = JSC::getVM(globalObject);
@@ -2030,6 +2040,9 @@ static JSValue constructStdioWriteStream(JSC::JSGlobalObject* globalObject, int 
     JSC::JSFunction* getStdioWriteStream = JSC::JSFunction::create(vm, globalObject, processObjectInternalsGetStdioWriteStreamCodeGenerator(vm), globalObject);
     JSC::MarkedArgumentBuffer args;
     args.append(JSC::jsNumber(fd));
+    args.append(jsBoolean(bun_stdio_tty[fd]));
+    BunProcessStdinFdType fdType = Bun__Process__getStdinFdType(Bun::vm(vm), fd);
+    args.append(jsNumber(static_cast<int32_t>(fdType)));
 
     JSC::CallData callData = JSC::getCallData(getStdioWriteStream);
 
@@ -2049,15 +2062,26 @@ static JSValue constructStdioWriteStream(JSC::JSGlobalObject* globalObject, int 
     ASSERT_WITH_MESSAGE(JSC::isJSArray(result), "Expected an array from getStdioWriteStream");
     JSC::JSArray* resultObject = JSC::jsCast<JSC::JSArray*>(result);
 
+    // process.stdout and process.stderr differ from other Node.js streams in important ways:
+    // 1. They are used internally by console.log() and console.error(), respectively.
+    // 2. Writes may be synchronous depending on what the stream is connected to and whether the system is Windows or POSIX:
+    // Files: synchronous on Windows and POSIX
+    // TTYs (Terminals): asynchronous on Windows, synchronous on POSIX
+    // Pipes (and sockets): synchronous on Windows, asynchronous on POSIX
+    bool forceSync = false;
 #if OS(WINDOWS)
-    Zig::GlobalObject* globalThis = jsCast<Zig::GlobalObject*>(globalObject);
-    // Node.js docs - https://nodejs.org/api/process.html#a-note-on-process-io
-    // > Files: synchronous on Windows and POSIX
-    // > TTYs (Terminals): asynchronous on Windows, synchronous on POSIX
-    // > Pipes (and sockets): synchronous on Windows, asynchronous on POSIX
-    // > Synchronous writes avoid problems such as output written with console.log() or console.error() being unexpectedly interleaved, or not written at all if process.exit() is called before an asynchronous write completes. See process.exit() for more information.
-    Bun__ForceFileSinkToBeSynchronousOnWindows(globalThis, JSValue::encode(resultObject->getIndex(globalObject, 1)));
+    forceSync = fdType == BunProcessStdinFdType::file || fdType == BunProcessStdinFdType::pipe;
+#else
+    // Note: files are always sync anyway.
+    // forceSync = fdType == BunProcessStdinFdType::file || bun_stdio_tty[fd];
+
+    // TDOO: once console.* is wired up to write/read through the same buffering mechanism as FileSink for process.stdout, process.stderr, we can make this non-blocking for sockets on POSIX.
+    // Until then, we have to force it to be sync EVEN for sockets or else console.log() may flush at a different time than process.stdout.write.
+    forceSync = true;
 #endif
+    if (forceSync) {
+        Bun__ForceFileSinkToBeSynchronousForProcessObjectStdio(globalObject, JSValue::encode(resultObject->getIndex(globalObject, 1)));
+    }
 
     return resultObject->getIndex(globalObject, 0);
 }
@@ -2076,8 +2100,6 @@ static JSValue constructStderr(VM& vm, JSObject* processObject)
 #define STDIN_FILENO 0
 #endif
 
-extern "C" int32_t Bun__Process__getStdinFdType(void*);
-
 static JSValue constructStdin(VM& vm, JSObject* processObject)
 {
     auto* globalObject = processObject->globalObject();
@@ -2086,7 +2108,8 @@ static JSValue constructStdin(VM& vm, JSObject* processObject)
     JSC::MarkedArgumentBuffer args;
     args.append(JSC::jsNumber(STDIN_FILENO));
     args.append(jsBoolean(bun_stdio_tty[STDIN_FILENO]));
-    args.append(jsNumber(Bun__Process__getStdinFdType(Bun::vm(vm))));
+    BunProcessStdinFdType fdType = Bun__Process__getStdinFdType(Bun::vm(vm), STDIN_FILENO);
+    args.append(jsNumber(static_cast<int32_t>(fdType)));
     JSC::CallData callData = JSC::getCallData(getStdioWriteStream);
 
     NakedPtr<JSC::Exception> returnedException = nullptr;
@@ -2302,13 +2325,9 @@ static JSValue maybe_uid_by_name(JSC::ThrowScope& throwScope, JSGlobalObject* gl
     if (!value.isString()) return value;
 
     auto str = value.getString(globalObject);
-    if (!str.is8Bit()) {
-        auto message = makeString("User identifier does not exist: "_s, str);
-        throwScope.throwException(globalObject, createError(globalObject, ErrorCode::ERR_UNKNOWN_CREDENTIAL, message));
-        return {};
-    }
-
-    auto name = (const char*)(str.span8().data());
+    RETURN_IF_EXCEPTION(throwScope, {});
+    auto utf8 = str.utf8();
+    auto name = utf8.data();
     struct passwd pwd;
     struct passwd* pp = nullptr;
     char buf[8192];
@@ -2328,13 +2347,9 @@ static JSValue maybe_gid_by_name(JSC::ThrowScope& throwScope, JSGlobalObject* gl
     if (!value.isString()) return value;
 
     auto str = value.getString(globalObject);
-    if (!str.is8Bit()) {
-        auto message = makeString("Group identifier does not exist: "_s, str);
-        throwScope.throwException(globalObject, createError(globalObject, ErrorCode::ERR_UNKNOWN_CREDENTIAL, message));
-        return {};
-    }
-
-    auto name = (const char*)(str.span8().data());
+    RETURN_IF_EXCEPTION(throwScope, {});
+    auto utf8 = str.utf8();
+    auto name = utf8.data();
     struct group pwd;
     struct group* pp = nullptr;
     char buf[8192];
@@ -2353,12 +2368,12 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetuid, (JSGlobalObject * globalObject,
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
+    uint32_t id = 0;
     auto is_number = value.isNumber();
     value = maybe_uid_by_name(scope, globalObject, value);
     RETURN_IF_EXCEPTION(scope, {});
-    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1));
-    RETURN_IF_EXCEPTION(scope, {});
-    auto id = value.toUInt32(globalObject);
+    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1), &id);
+    if (!is_number) id = value.toUInt32(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
     auto result = setuid(id);
     if (result != 0) throwSystemError(scope, globalObject, "setuid"_s, errno);
@@ -2371,12 +2386,12 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionseteuid, (JSGlobalObject * globalObject
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
+    uint32_t id = 0;
     auto is_number = value.isNumber();
     value = maybe_uid_by_name(scope, globalObject, value);
     RETURN_IF_EXCEPTION(scope, {});
-    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1));
-    RETURN_IF_EXCEPTION(scope, {});
-    auto id = value.toUInt32(globalObject);
+    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1), &id);
+    if (!is_number) id = value.toUInt32(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
     auto result = seteuid(id);
     if (result != 0) throwSystemError(scope, globalObject, "seteuid"_s, errno);
@@ -2389,12 +2404,12 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetegid, (JSGlobalObject * globalObject
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
+    uint32_t id = 0;
     auto is_number = value.isNumber();
     value = maybe_gid_by_name(scope, globalObject, value);
     RETURN_IF_EXCEPTION(scope, {});
-    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1));
-    RETURN_IF_EXCEPTION(scope, {});
-    auto id = value.toUInt32(globalObject);
+    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1), &id);
+    if (!is_number) id = value.toUInt32(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
     auto result = setegid(id);
     if (result != 0) throwSystemError(scope, globalObject, "setegid"_s, errno);
@@ -2407,12 +2422,12 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionsetgid, (JSGlobalObject * globalObject,
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto value = callFrame->argument(0);
+    uint32_t id = 0;
     auto is_number = value.isNumber();
     value = maybe_gid_by_name(scope, globalObject, value);
     RETURN_IF_EXCEPTION(scope, {});
-    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1));
-    RETURN_IF_EXCEPTION(scope, {});
-    auto id = value.toUInt32(globalObject);
+    if (is_number) Bun::V::validateInteger(scope, globalObject, value, "id"_s, jsNumber(0), jsNumber(std::pow(2, 31) - 1), &id);
+    if (!is_number) id = value.toUInt32(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
     auto result = setgid(id);
     if (result != 0) throwSystemError(scope, globalObject, "setgid"_s, errno);
@@ -2540,10 +2555,11 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionBinding, (JSGlobalObject * jsGlobalObje
     auto globalObject = jsCast<Zig::GlobalObject*>(jsGlobalObject);
     auto process = jsCast<Process*>(globalObject->processObject());
     auto moduleName = callFrame->argument(0).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(throwScope, {});
 
     // clang-format off
     if (moduleName == "async_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("async_wrap");
-    if (moduleName == "buffer"_s) PROCESS_BINDING_NOT_IMPLEMENTED_ISSUE("buffer", "2020");
+    if (moduleName == "buffer"_s) return JSValue::encode(globalObject->processBindingBuffer());
     if (moduleName == "cares_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("cares_wrap");
     if (moduleName == "config"_s) return JSValue::encode(processBindingConfig(globalObject, vm));
     if (moduleName == "constants"_s) return JSValue::encode(globalObject->processBindingConstants());
@@ -2744,7 +2760,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionCpuUsage, (JSC::JSGlobalObject * global
     RELEASE_AND_RETURN(throwScope, JSC::JSValue::encode(result));
 }
 
-int getRSS(size_t* rss)
+extern "C" int getRSS(size_t* rss)
 {
 #if defined(__APPLE__)
     mach_msg_type_number_t count;

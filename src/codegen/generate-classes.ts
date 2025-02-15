@@ -560,7 +560,7 @@ class ${name} final : public JSC::InternalFunction {
       )}* prototype);
 
       static constexpr unsigned StructureFlags = Base::StructureFlags;
-      static constexpr bool needsDestruction = false;
+      static constexpr JSC::DestructionMode needsDestruction = DoesNotNeedDestruction;
 
       static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype)
       {
@@ -2064,7 +2064,7 @@ const JavaScriptCoreBindings = struct {
       `
   };
   comptime {
-${[...exports.values()].map(name => `      @export(JavaScriptCoreBindings.${name}, .{ .name = "${name}" });`).join("\n")}
+${[...exports.values()].map(name => `      @export(&JavaScriptCoreBindings.${name}, .{ .name = "${name}" });`).join("\n")}
     }`
     );
   }
@@ -2281,7 +2281,7 @@ JSC_DEFINE_HOST_FUNCTION(Zig::jsFunctionInherits, (JSC::JSGlobalObject * globalO
     switch (id) {
 ${jsclasses
   .map(v => v[0])
-  .map((v, i) => `    case ${i}: return JSValue::encode(jsBoolean(cell->inherits<WebCore::JS${v}>()));`)
+  .map((v, i) => `    case ${i}: return JSValue::encode(jsBoolean(jsDynamicCast<WebCore::JS${v}*>(cell) != nullptr));`)
   .join("\n")}
     }
     return JSValue::encode(jsBoolean(false));
