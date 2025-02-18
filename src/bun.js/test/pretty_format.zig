@@ -12,7 +12,6 @@ const string = bun.string;
 const JSLexer = bun.js_lexer;
 const JSPrinter = bun.js_printer;
 const JSPrivateDataPtr = JSC.JSPrivateDataPtr;
-const JS = @import("../javascript.zig");
 const JSPromise = JSC.JSPromise;
 const expect = @import("./expect.zig");
 
@@ -1050,7 +1049,7 @@ pub const JestPrettyFormat = struct {
                             1;
                         this.addForNewLine(digits);
                     } else {
-                        this.addForNewLine(bun.fmt.count("{d}", .{int}));
+                        this.addForNewLine(std.fmt.count("{d}", .{int}));
                     }
                     writer.print(comptime Output.prettyFmt("<r><yellow>{d}<r>", enable_ansi_colors), .{int});
                 },
@@ -1234,7 +1233,7 @@ pub const JestPrettyFormat = struct {
                             return error.JSError;
                         };
                     } else if (value.as(JSC.WebCore.Request)) |request| {
-                        request.writeFormat(Formatter, this, writer_, enable_ansi_colors) catch |err| {
+                        request.writeFormat(value, Formatter, this, writer_, enable_ansi_colors) catch |err| {
                             this.failed = true;
                             // TODO: make this better
                             if (!this.globalThis.hasException()) {
@@ -1986,7 +1985,7 @@ pub const JestPrettyFormat = struct {
             // comptime var so we have to repeat it here. The rationale there is
             // it _should_ limit the stack usage because each version of the
             // function will be relatively small
-            return try switch (result.tag) {
+            return switch (result.tag) {
                 .StringPossiblyFormatted => this.printAs(.StringPossiblyFormatted, Writer, writer, value, result.cell, enable_ansi_colors),
                 .String => this.printAs(.String, Writer, writer, value, result.cell, enable_ansi_colors),
                 .Undefined => this.printAs(.Undefined, Writer, writer, value, result.cell, enable_ansi_colors),
